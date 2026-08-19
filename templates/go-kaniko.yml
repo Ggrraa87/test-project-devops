@@ -1,0 +1,403 @@
+spec:
+  inputs:
+    app_name:
+      type: string
+    build_package:
+      type: string
+      default: "./cmd/server"
+    dockerfile:
+      type: string
+      default: "Dockerfile"
+    coverage_threshold:
+      type: number
+      default: 20
+    scan_severity:
+      type: string
+      default: "HIGH,CRITICAL"
+
+---
+
+include:
+  - local: /templates/stand.yml
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        NEXUS_CREDENTIAL_CLASS: release
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        NEXUS_CREDENTIAL_CLASS: snapshot
+    - when: never
+
+stages:
+  - validate
+  - security
+  - test
+  - build
+  - package
+  - scan
+  - publish
+  - notify
+
+variables:
+  APP_NAME: "$[[ inputs.app_name ]]"
+  BUILD_PACKAGE: "$[[ inputs.build_package ]]"
+  DOCKERFILE: "$[[ inputs.dockerfile ]]"
+  COVERAGE_THRESHOLD: "$[[ inputs.coverage_threshold ]]"
+  SCAN_SEVERITY: "$[[ inputs.scan_severity ]]"
+
+  IMAGE_REPOSITORY: "$NEXUS_REGISTRY/$NEXUS_DOCKER_REPOSITORY/$APP_NAME"
+  VAULT_SIGNING_KEY: "${APP_NAME}-signing"
+  WEBHOOK_SECRET_PATH: "webhook/${APP_NAME}"
+
+  GOSUMDB: "off"
+  GOFLAGS: "-mod=readonly"
+
+  SECRETS_DIR: "$CI_PROJECT_DIR/.secrets"
+  NETRC_FILE: "$CI_PROJECT_DIR/.secrets/netrc"
+
+  GIT_DEPTH: "20"
+
+default:
+  image: "$CI_TOOLS_IMAGE"
+  tags:
+    - "$RUNNER_TAG"
+  interruptible: true
+  timeout: 30m
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+.fn:
+  script:
+    - |
+      fail() { echo "ci: FATAL: $*" >&2; exit 1; }
+
+      assert_uid() {
+        [ "$(id -u)" = "$JOB_UID" ] \
+          || fail "expected uid $JOB_UID but running as $(id -u)"
+        echo "ci: running as uid $(id -u), gid $(id -g)"
+      }
+
+      vault_login() {
+        [ -n "${VAULT_ID_TOKEN:-}" ] || fail "no GitLab ID token present in job"
+        [ -n "${VAULT_ROLE:-}" ]     || fail "VAULT_ROLE is not resolved"
+        mkdir -p "$SECRETS_DIR"; umask 077
+        jq -cn --arg role "$VAULT_ROLE" --arg jwt "$VAULT_ID_TOKEN" \
+               '{role:$role, jwt:$jwt}' > "$SECRETS_DIR/login.json"
+        VAULT_TOKEN="$(
+          wget -q -O - --header='Content-Type: application/json' \
+               --post-file="$SECRETS_DIR/login.json" \
+               "$VAULT_ADDR/v1/auth/$VAULT_AUTH_PATH/login" \
+          | jq -er '.auth.client_token'
+        )" || fail "Vault login rejected for role $VAULT_ROLE"
+        rm -f "$SECRETS_DIR/login.json"
+        export VAULT_TOKEN
+        echo "ci: authenticated to Vault as role $VAULT_ROLE"
+      }
+
+      vault_secret() {
+        wget -q -O - --header="X-Vault-Token: $VAULT_TOKEN" \
+             "$VAULT_ADDR/v1/$VAULT_KV_MOUNT/data/$1" \
+          | jq -ec '.data.data' || fail "cannot read Vault secret $1"
+      }
+
+      nexus_auth() {
+        [ -n "${NEXUS_CREDENTIAL_CLASS:-}" ] || fail "no Nexus credential class"
+        _secret="$(vault_secret "nexus/$NEXUS_CREDENTIAL_CLASS")"
+        NEXUS_USERNAME="$(printf '%s' "$_secret" | jq -er .username)"
+        NEXUS_PASSWORD="$(printf '%s' "$_secret" | jq -er .password)"
+        export NEXUS_USERNAME NEXUS_PASSWORD
+        mkdir -p "$SECRETS_DIR"; umask 077
+        printf 'machine %s login %s password %s\n' \
+          "$NEXUS_HOST" "$NEXUS_USERNAME" "$NEXUS_PASSWORD" > "$NETRC_FILE"
+        unset _secret
+        echo "ci: loaded Nexus $NEXUS_CREDENTIAL_CLASS credentials"
+      }
+
+      nexus_docker_config() {
+        nexus_auth
+        mkdir -p "$(dirname "$DOCKER_CONFIG_FILE")"; umask 077
+        jq -cn --arg registry "$NEXUS_REGISTRY" \
+               --arg auth "$(printf '%s:%s' "$NEXUS_USERNAME" "$NEXUS_PASSWORD" | base64 | tr -d '\n')" \
+               '{auths: {($registry): {auth: $auth}}}' > "$DOCKER_CONFIG_FILE"
+        echo "ci: wrote registry config for $NEXUS_REGISTRY"
+      }
+
+      sign_file() {
+        _target="$1"; _sig="$2"
+        [ -s "$_target" ] || fail "nothing to sign: $_target"
+        mkdir -p "$SECRETS_DIR"; umask 077
+        openssl verify -CAfile "$SIGNER_CA_FILE" "$SIGNER_CERT_FILE" >/dev/null
+        openssl x509 -in "$SIGNER_CERT_FILE" -pubkey -noout > "$SECRETS_DIR/signing.pub"
+        _digest=$(openssl dgst -sha256 -binary "$_target" | base64 | tr -d '\n')
+        _signature=$(
+          jq -cn --arg input "$_digest" \
+             '{input:$input, prehashed:true, hash_algorithm:"sha2-256", marshaling_algorithm:"asn1"}' \
+          | curl -fsS --max-time 15 -H "X-Vault-Token: $VAULT_TOKEN" \
+                 -H 'Content-Type: application/json' --data-binary @- \
+                 "$VAULT_ADDR/v1/$VAULT_SIGNING_MOUNT/sign/$VAULT_SIGNING_KEY" \
+          | jq -er '.data.signature'
+        )
+        printf '%s' "${_signature##*:}" | base64 -d > "$_sig"
+        openssl dgst -sha256 -verify "$SECRETS_DIR/signing.pub" \
+                     -signature "$_sig" "$_target" >/dev/null \
+          || fail "signature does not verify against $SIGNER_CERT_FILE"
+        echo "ci: signed $_target -> $_sig"
+      }
+
+      resolve_version() {
+        if [ -n "${CI_COMMIT_TAG:-}" ]; then
+          VERSION="$CI_COMMIT_TAG"
+        else
+          VERSION="sha-${CI_COMMIT_SHORT_SHA}-p${CI_PIPELINE_ID}"
+        fi
+        export VERSION
+      }
+
+.cleanup_secrets:
+  after_script:
+    - rm -rf "$SECRETS_DIR"
+    - 'if [ -n "${DOCKER_CONFIG_FILE:-}" ]; then rm -f "$DOCKER_CONFIG_FILE"; fi'
+
+.base:
+  before_script:
+    - !reference [.fn, script]
+    - assert_uid
+
+.scope:
+  interruptible: false
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        VAULT_ROLE: "$VAULT_ROLE_PREFIX-release"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        VAULT_ROLE: "$VAULT_ROLE_PREFIX-snapshot"
+
+.vault_scope:
+  extends: [.scope, .cleanup_secrets]
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: "$VAULT_AUDIENCE"
+  before_script:
+    - !reference [.fn, script]
+    - assert_uid
+    - vault_login
+
+lint:
+  extends: .base
+  stage: validate
+  script:
+    - test -z "$(gofmt -l .)" || fail "gofmt reported unformatted files"
+    - go mod download
+    - go mod verify
+    - go vet ./...
+
+gosec:
+  extends: .base
+  stage: security
+  needs: []
+  script:
+    - mkdir -p reports
+    - gosec -severity high -confidence medium -fmt json -out reports/gosec.json ./...
+  artifacts:
+    when: always
+    expire_in: "30 days"
+    paths: [reports/gosec.json]
+
+gitleaks:
+  extends: .base
+  stage: security
+  needs: []
+  script:
+    - mkdir -p reports
+    - gitleaks git --redact --report-format json --report-path reports/gitleaks.json .
+  artifacts:
+    when: always
+    expire_in: "30 days"
+    paths: [reports/gitleaks.json]
+
+test:
+  extends: .base
+  stage: test
+  needs: []
+  script:
+    - mkdir -p reports
+    - go test -race -coverprofile=reports/coverage.out ./...
+    - go tool cover -func=reports/coverage.out | tee reports/coverage.txt
+    - covered=$(awk '$1 == "total:" { print int($3) }' reports/coverage.txt)
+    - '[ "$covered" -ge "$COVERAGE_THRESHOLD" ] || fail "coverage ${covered}% is below the ${COVERAGE_THRESHOLD}% gate"'
+    - 'echo "ci: coverage ${covered}% meets the ${COVERAGE_THRESHOLD}% gate"'
+  coverage: '/total:\s+\(statements\)\s+([0-9.]+%)/'
+  artifacts:
+    when: always
+    expire_in: "30 days"
+    paths: [reports/coverage.out, reports/coverage.txt]
+
+build_binary:
+  extends: .base
+  stage: build
+  script:
+    - mkdir -p dist
+    - resolve_version
+    - BUILD_DATE="$(git show -s --format=%cI "$CI_COMMIT_SHA")"
+    - CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+        go build -trimpath -ldflags="-s -w" -o "dist/$APP_NAME" "$BUILD_PACKAGE"
+    - sha256sum "dist/$APP_NAME" > dist/SHA256SUMS
+    - sha256sum -c dist/SHA256SUMS
+    - printf 'VERSION=%s\nIMAGE_TAG=%s\nBUILD_DATE=%s\n' "$VERSION" "$VERSION" "$BUILD_DATE" > dist/build.env
+    - cat dist/build.env
+  artifacts:
+    expire_in: "30 days"
+    paths: [dist/]
+    reports:
+      dotenv: dist/build.env
+
+sign_binary:
+  extends: .vault_scope
+  stage: package
+  needs:
+    - job: build_binary
+      artifacts: true
+  script:
+    - sign_file "dist/$APP_NAME" "dist/$APP_NAME.sig"
+  artifacts:
+    expire_in: "30 days"
+    paths: [dist/]
+
+build_image:
+  extends: .vault_scope
+  stage: package
+  image:
+    name: "$KANIKO_IMAGE"
+    entrypoint: [""]
+  variables:
+    DOCKER_CONFIG_FILE: /workspace/.docker/config.json
+  needs:
+    - job: build_binary
+      artifacts: true
+  script:
+    - nexus_docker_config
+    - |
+      /kaniko/executor \
+        --context "$CI_PROJECT_DIR" \
+        --dockerfile "$CI_PROJECT_DIR/$DOCKERFILE" \
+        --destination "$IMAGE_REPOSITORY:$IMAGE_TAG" \
+        --build-arg "VERSION=$VERSION" \
+        --build-arg "VCS_REF=$CI_COMMIT_SHA" \
+        --build-arg "BUILD_DATE=$BUILD_DATE" \
+        --digest-file "$CI_PROJECT_DIR/dist/image-digest.txt" \
+        --snapshot-mode=redo \
+        --use-new-run \
+        --reproducible \
+        $KANIKO_REGISTRY_FLAGS
+    - printf 'IMAGE_REF=%s@%s\n' "$IMAGE_REPOSITORY" "$(cat dist/image-digest.txt)" > dist/image.env
+    - cat dist/image.env
+  artifacts:
+    expire_in: "30 days"
+    paths: [dist/image-digest.txt, dist/image.env]
+    reports:
+      dotenv: dist/image.env
+
+scan_image:
+  extends: .vault_scope
+  stage: scan
+  needs:
+    - job: build_image
+      artifacts: true
+  script:
+    - mkdir -p reports
+    - nexus_auth
+    - export TRIVY_USERNAME="$NEXUS_USERNAME" TRIVY_PASSWORD="$NEXUS_PASSWORD"
+    - trivy image --exit-code 1 --severity "$SCAN_SEVERITY" --format json --output reports/trivy-image.json "$IMAGE_REF"
+    - sign_file dist/image-digest.txt reports/image-digest.sig
+  artifacts:
+    when: always
+    expire_in: "30 days"
+    paths: [reports/, dist/image-digest.txt, dist/image.env]
+
+publish_raw:
+  extends: .vault_scope
+  stage: publish
+  resource_group: "publish-$APP_NAME"
+  needs:
+    - job: build_binary
+      artifacts: true
+    - job: sign_binary
+      artifacts: true
+    - job: build_image
+      artifacts: true
+    - job: scan_image
+      artifacts: true
+    - job: gosec
+      artifacts: true
+    - job: gitleaks
+      artifacts: true
+    - job: test
+      artifacts: true
+  script:
+    - nexus_auth
+    - BASE_URL="$NEXUS_URL/repository/$NEXUS_RAW_REPOSITORY/$APP_NAME/$VERSION"
+    - |
+      ARTEFACTS="dist/$APP_NAME dist/SHA256SUMS dist/$APP_NAME.sig
+                 dist/image-digest.txt reports/image-digest.sig
+                 reports/coverage.txt reports/gosec.json reports/gitleaks.json
+                 reports/trivy-image.json $SIGNER_CERT_FILE $SIGNER_CA_FILE"
+
+      for file in $ARTEFACTS; do
+        [ -s "$file" ] || fail "release artefact is missing: $file"
+      done
+
+      for file in $ARTEFACTS; do
+        curl -fsS --retry 3 --netrc-file "$NETRC_FILE" \
+             --upload-file "$file" "$BASE_URL/$(basename "$file")"
+        echo "ci: published $(basename "$file")"
+      done
+    - printf 'ARTIFACT_URL=%s/%s\n' "$BASE_URL" "$APP_NAME" > dist/publish.env
+    - cat dist/publish.env
+  artifacts:
+    expire_in: "30 days"
+    paths: [dist/publish.env, dist/image.env]
+    reports:
+      dotenv: dist/publish.env
+
+.notify:
+  extends: .vault_scope
+  stage: notify
+  cache: []
+  script:
+    - WEBHOOK_HMAC_SECRET="$(vault_secret "$WEBHOOK_SECRET_PATH" | jq -er .hmac_secret)"
+    - export WEBHOOK_HMAC_SECRET
+    - python3 "$WEBHOOK_SCRIPT"
+
+notify_success:
+  extends: .notify
+  variables:
+    WEBHOOK_STATUS: success
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        VAULT_ROLE: "$VAULT_ROLE_PREFIX-release"
+      when: on_success
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        VAULT_ROLE: "$VAULT_ROLE_PREFIX-snapshot"
+      when: on_success
+
+notify_failure:
+  extends: .notify
+  variables:
+    WEBHOOK_STATUS: failed
+  rules:
+    - if: $CI_COMMIT_TAG
+      variables:
+        VAULT_ROLE: "$VAULT_ROLE_PREFIX-release"
+      when: on_failure
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        VAULT_ROLE: "$VAULT_ROLE_PREFIX-snapshot"
+      when: on_failure

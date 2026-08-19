@@ -1,0 +1,21 @@
+name: devsecops-kaniko-runner
+
+services:
+  runner:
+    image: gitlab/gitlab-runner:alpine-v18.6.2@sha256:fac86bd5bb1016c18e8b29e50d2e5ab451db9e989a1cc14a78de5d028c1f86c6
+    container_name: devsecops-kaniko-runner
+    restart: unless-stopped
+    user: "65532:988"
+    environment:
+      HOME: /etc/gitlab-runner
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m
+    volumes:
+      - ./config:/etc/gitlab-runner 
+      - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
